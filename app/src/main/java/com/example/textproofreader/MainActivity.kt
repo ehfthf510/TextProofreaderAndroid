@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var model: EditText
     private lateinit var openButton: Button
     private lateinit var correctButton: Button
+    private lateinit var offlineButton: Button
     private lateinit var saveButton: Button
 
     private class ApiException(val code: Int, message: String) : Exception(message)
@@ -147,6 +148,9 @@ class MainActivity : Activity() {
         root.addView(sectionTitle("3. 교정 실행 및 결과 확인"))
         correctButton = actionButton("AI 문장 교정 시작") { startCorrection() }
         root.addView(correctButton)
+        offlineButton = actionButton("오프라인 간단 교정 (인터넷 불필요)") { startOfflineCorrection() }
+        root.addView(offlineButton)
+        root.addView(label("오프라인 교정은 자주 틀리는 표기와 띄어쓰기·문장부호만 규칙으로 고칩니다. 문법·문맥 교정은 AI 교정을 쓰세요."))
         preview = EditText(this).apply {
             hint = "파일을 선택하면 내용이 여기에 표시됩니다. 교정 전에 직접 수정할 수도 있습니다."
             minLines = 8
@@ -240,6 +244,7 @@ class MainActivity : Activity() {
     private fun setBusy(value: Boolean) {
         busy = value
         correctButton.isEnabled = !value
+        offlineButton.isEnabled = !value
         openButton.isEnabled = !value
         saveButton.isEnabled = !value
     }
@@ -283,6 +288,73 @@ class MainActivity : Activity() {
                 mainHandler.post {
                     setBusy(false)
                     showStatus("교정 실패: ${e.message ?: "알 수 없는 오류"}", true)
+                }
+            }
+        }
+    }
+
+
+    // ---- 오프라인(규칙 기반) 교정 ----
+    // 정확도가 높은 규칙만 사용한다. 인터넷·AI 없이 동작하지만 문법/문맥 교정은 하지 못한다.
+    private val offlineRules: List<Pair<Regex, String>> = listOf(
+        // 자주 틀리는 표기
+        Regex("(?<![가-힣])안\\s?되요") to "안 돼요",
+        Regex("(?<![가-힣])안(돼요)") to "안 \$1",
+        Regex("않되") to "안 돼",
+        Regex("되요") to "돼요",
+        Regex("뵈요") to "봬요",
+        Regex("몇일") to "며칠",
+        Regex("어떻해") to "어떡해",
+        Regex("(할|갈|올|볼|줄|드릴|해줄|살|쓸)께") to "\$1게",
+        Regex("웬지") to "왠지",
+        Regex("왠만") to "웬만",
+        Regex("어의없") to "어이없",
+        Regex("금새") to "금세",
+        Regex("설레임") to "설렘",
+        Regex("희안") to "희한",
+        Regex("역활") to "역할",
+        Regex("오랫만") to "오랜만",
+        Regex("갯수") to "개수",
+        Regex("어쨋든") to "어쨌든",
+        // 문장부호와 띄어쓰기
+        Regex("[ \\t]+([,.!?])") to "\$1",
+        Regex(",{2,}") to ",",
+        Regex("(?<=[가-힣])([,!?])(?=[가-힣A-Za-z])") to "\$1 ",
+        Regex("(?<=[가-힣])\\.(?=[가-힣])") to ". ",
+        Regex("(?<=\\S)[ \\t]{2,}(?=\\S)") to " ",
+        Regex("[ \\t]+\$", RegexOption.MULTILINE) to "",
+        Regex("\n{3,}") to "\n\n"
+    )
+
+    private fun offlineProofread(input: String): Pair<String, Int> {
+        var text = input.replace("\r\n", "\n").replace("\r", "\n")
+        var count = 0
+        for ((regex, replacement) in offlineRules) {
+            count += regex.findAll(text).count()
+            text = regex.replace(text, replacement)
+        }
+        return text to count
+    }
+
+    private fun startOfflineCorrection() {
+        val original = preview.text.toString()
+        if (original.isBlank()) { showStatus("교정할 내용이 비어 있습니다. 파일을 선택하거나 내용을 붙여넣으세요.", true); return }
+        setBusy(true)
+        showStatus("오프라인 교정 중…", false)
+        executor.execute {
+            try {
+                val (result, count) = offlineProofread(original)
+                mainHandler.post {
+                    correctedText = result
+                    preview.setText(result)
+                    setBusy(false)
+                    showStatus("오프라인 교정 완료: 약 ${count}곳 수정. 규칙 기반이라 문법·문맥은 검사하지 못합니다. 결과를 확인한 뒤 저장하세요.", false)
+                    hideKeyboard()
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    setBusy(false)
+                    showStatus("오프라인 교정 실패: ${e.message ?: "알 수 없는 오류"}", true)
                 }
             }
         }
