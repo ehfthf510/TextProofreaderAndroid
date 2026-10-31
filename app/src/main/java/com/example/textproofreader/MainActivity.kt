@@ -31,6 +31,9 @@ class MainActivity : Activity() {
     private var destinationTree: Uri? = null
     private var correctedText: String = ""
     private var busy = false
+    private var pendingSave = false
+    private lateinit var rememberKey: CheckBox
+    private val prefs by lazy { getSharedPreferences("settings", Context.MODE_PRIVATE) }
 
     private lateinit var sourceLabel: TextView
     private lateinit var folderLabel: TextView
@@ -54,6 +57,15 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
+        // 이전에 지정한 저장 폴더가 아직 유효하면 다시 사용한다.
+        prefs.getString("tree", null)?.let { saved ->
+            val uri = Uri.parse(saved)
+            val ok = contentResolver.persistedUriPermissions.any { it.uri == uri && it.isWritePermission }
+            if (ok) {
+                destinationTree = uri
+                folderLabel.text = "저장 폴더: 이전에 지정한 폴더를 사용합니다. (바꾸려면 다시 지정)"
+            }
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -107,9 +119,10 @@ class MainActivity : Activity() {
             setTextSize(14f)
         }
         root.addView(apiKey, matchWrap())
+        if (prefs.getBoolean("remember_key", false)) apiKey.setText(prefs.getString("api_key", ""))
         root.addView(label("API 주소 (OpenAI 호환 Chat Completions)"))
         endpoint = EditText(this).apply {
-            setText("https://api.openai.com/v1/chat/completions")
+            setText(prefs.getString("endpoint", "https://api.openai.com/v1/chat/completions"))
             setTextSize(14f)
             isSingleLine = true
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
@@ -117,11 +130,17 @@ class MainActivity : Activity() {
         root.addView(endpoint, matchWrap())
         root.addView(label("모델 이름"))
         model = EditText(this).apply {
-            setText("gpt-4o-mini")
+            setText(prefs.getString("model", "gpt-4o-mini"))
             setTextSize(14f)
             isSingleLine = true
         }
         root.addView(model, matchWrap())
+        rememberKey = CheckBox(this).apply {
+            text = "API 키도 이 기기에 기억하기 (분실·공유 시 위험)"
+            textSize = 13f
+            isChecked = prefs.getBoolean("remember_key", false)
+        }
+        root.addView(rememberKey, matchWrap())
         root.addView(label("API 사용료는 해당 AI 서비스 계정에 청구될 수 있습니다."))
         root.addView(space(10))
 
@@ -144,7 +163,6 @@ class MainActivity : Activity() {
         folderLabel = label("저장 폴더가 지정되지 않았습니다.")
         root.addView(folderLabel)
         saveButton = actionButton("교정된 파일 저장") { saveCorrectedFile() }
-        saveButton.isEnabled = false
         root.addView(saveButton)
         root.addView(space(10))
         statusLabel = label("준비되었습니다. 원본 파일은 덮어쓰지 않습니다.")
@@ -173,7 +191,10 @@ class MainActivity : Activity() {
     @Deprecated("Uses the document picker result for broad Android compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (resultCode != Activity.RESULT_OK || data?.data == null) return
+        if (resultCode != Activity.RESULT_OK || data?.data == null) {
+            if (requestCode == REQ_PICK_FOLDER) pendingSave = false
+            return
+        }
         val uri = data.data!!
         when (requestCode) {
             REQ_OPEN_TEXT -> {
@@ -194,7 +215,6 @@ class MainActivity : Activity() {
                             sourceLabel.text = "선택 파일: $name ($encoding)"
                             preview.setText(text)
                             correctedText = ""
-                            saveButton.isEnabled = false
                             showStatus("파일을 불러왔습니다(인식된 인코딩: $encoding). AI 연결 설정 후 교정을 시작하세요.", false)
                         }
                     } catch (e: Exception) {
@@ -208,7 +228,11 @@ class MainActivity : Activity() {
                     contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                 } catch (_: Exception) { }
                 folderLabel.text = "저장 폴더가 지정되었습니다."
-                updateSaveEnabled()
+                savePrefs()
+                if (pendingSave) {
+                    pendingSave = false
+                    saveCorrectedFile()
+                }
             }
         }
     }
@@ -217,7 +241,7 @@ class MainActivity : Activity() {
         busy = value
         correctButton.isEnabled = !value
         openButton.isEnabled = !value
-        if (value) saveButton.isEnabled = false else updateSaveEnabled()
+        saveButton.isEnabled = !value
     }
 
     private fun startCorrection() {
@@ -232,6 +256,7 @@ class MainActivity : Activity() {
         val original = preview.text.toString()
         if (original.isBlank()) { showStatus("교정할 내용이 비어 있습니다.", true); return }
 
+        savePrefs()
         setBusy(true)
         showStatus("AI 교정을 진행하고 있습니다…", false)
         executor.execute {
@@ -357,8 +382,14 @@ class MainActivity : Activity() {
     private fun saveCorrectedFile() {
         val tree = destinationTree
         val text = preview.text.toString()
-        if (tree == null) { showStatus("먼저 저장 폴더를 지정하세요.", true); return }
         if (correctedText.isBlank()) { showStatus("먼저 AI 교정을 완료하세요.", true); return }
+        if (tree == null) {
+            // 폴더가 없으면 폴더 선택 화면을 띄우고, 선택이 끝나면 자동으로 저장한다.
+            pendingSave = true
+            showStatus("저장할 폴더를 선택하세요. 선택하면 바로 저장됩니다.", false)
+            pickFolder()
+            return
+        }
         // 화면에 보이는 텍스트를 저장하므로 사용자가 최종 수동 수정을 할 수 있다.
         val finalText = text
         try {
@@ -376,7 +407,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateSaveEnabled() {
-        saveButton.isEnabled = !busy && correctedText.isNotBlank() && destinationTree != null
+        saveButton.isEnabled = !busy
     }
 
     private fun readAllBytes(input: InputStream): ByteArray = input.use { it.readBytes() }
@@ -439,6 +470,22 @@ class MainActivity : Activity() {
     private fun space(height: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(1, dp(height)) }
     private fun matchWrap() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+    private fun savePrefs() {
+        if (!::rememberKey.isInitialized) return
+        val e = prefs.edit()
+            .putString("endpoint", endpoint.text.toString().trim())
+            .putString("model", model.text.toString().trim())
+            .putBoolean("remember_key", rememberKey.isChecked)
+        if (rememberKey.isChecked) e.putString("api_key", apiKey.text.toString().trim()) else e.remove("api_key")
+        destinationTree?.let { e.putString("tree", it.toString()) }
+        e.apply()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        savePrefs()
+    }
 
     override fun onDestroy() {
         super.onDestroy()
