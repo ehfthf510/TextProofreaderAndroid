@@ -25,6 +25,8 @@ import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private val executor = Executors.newSingleThreadExecutor()
+    // 긴 글은 여러 조각을 동시에(최대 3개) 보내 속도를 높인다.
+    private val workers = Executors.newFixedThreadPool(3)
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var sourceUri: Uri? = null
     private var sourceName: String = ""
@@ -56,7 +58,9 @@ class MainActivity : Activity() {
         private const val REQ_PICK_FOLDER = 1002
         private const val CHUNK_CHARS = 2000
         private const val DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        private const val DEFAULT_MODEL = "gemini-3.8-flash"
+        private const val MODEL_FAST = "gemini-3.5-flash-lite"
+        private const val MODEL_ACCURATE = "gemini-3.8-flash"
+        private const val DEFAULT_MODEL = MODEL_FAST
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -133,13 +137,36 @@ class MainActivity : Activity() {
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
         }
         root.addView(endpoint, matchWrap())
-        root.addView(label("모델 이름"))
+        root.addView(label("모델 선택"))
+        val presetNames = listOf(
+            "$MODEL_FAST  (빠름 · 기본)",
+            "$MODEL_ACCURATE  (더 정확)"
+        )
+        val presetIds = listOf(MODEL_FAST, MODEL_ACCURATE)
+        val modelSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, presetNames)
+        }
+        root.addView(modelSpinner, matchWrap())
+        root.addView(label("모델 이름 (위에서 고르면 자동 입력, 다른 모델은 직접 입력)"))
         model = EditText(this).apply {
             setText(initialModel())
             setTextSize(14f)
             isSingleLine = true
         }
         root.addView(model, matchWrap())
+        // 저장된 모델이 목록에 있으면 그 항목을 표시하고, 없으면(직접 입력한 모델) 입력칸 값을 유지한다.
+        val startIndex = presetIds.indexOf(model.text.toString().trim())
+        var userPicked = false
+        modelSpinner.setSelection(if (startIndex >= 0) startIndex else 0, false)
+        // 사용자가 직접 눌러 고른 경우에만 입력칸을 바꾼다(화면이 처음 그려질 때의 자동 호출은 무시).
+        modelSpinner.setOnTouchListener { _, _ -> userPicked = true; false }
+        modelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (!userPicked) return
+                model.setText(presetIds[position])
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
         rememberKey = CheckBox(this).apply {
             text = "API 키도 이 기기에 기억하기 (분실·공유 시 위험)"
             textSize = 13f
@@ -279,11 +306,27 @@ class MainActivity : Activity() {
         executor.execute {
             try {
                 val chunks = splitChunks(source, CHUNK_CHARS)
+                val total = chunks.count { it.isNotBlank() }
+                val done = java.util.concurrent.atomic.AtomicInteger(0)
+                val futures: List<java.util.concurrent.Future<String>?> = chunks.map { chunk ->
+                    if (chunk.isBlank()) null
+                    else workers.submit(java.util.concurrent.Callable<String> {
+                        val corrected = callAi(apiUrl, key, modelName, chunk)
+                        val n = done.incrementAndGet()
+                        mainHandler.post { showStatus("AI 교정 중… ($n/$total)", false) }
+                        corrected
+                    })
+                }
                 val out = StringBuilder()
                 for ((index, chunk) in chunks.withIndex()) {
-                    if (chunk.isBlank()) { out.append(chunk); continue }
-                    mainHandler.post { showStatus("AI 교정 중… (${index + 1}/${chunks.size})", false) }
-                    val corrected = callAi(apiUrl, key, modelName, chunk)
+                    val future = futures[index]
+                    if (future == null) { out.append(chunk); continue }
+                    val corrected = try {
+                        future.get()
+                    } catch (e: java.util.concurrent.ExecutionException) {
+                        futures.forEach { it?.cancel(true) }
+                        throw (e.cause as? Exception ?: e)
+                    }
                     // 각 조각 끝의 줄바꿈/공백을 그대로 유지해 문단 구조를 보존한다.
                     val trailing = chunk.takeLastWhile { it.isWhitespace() }
                     out.append(corrected.trimEnd()).append(trailing)
@@ -434,6 +477,7 @@ class MainActivity : Activity() {
         var reasoning = isGemini
         var timeoutRetried = false
         var attempts = 0
+        var busyRetries = 0
         while (true) {
             attempts++
             try {
@@ -442,6 +486,12 @@ class MainActivity : Activity() {
                 val msg = e.message ?: ""
                 if (attempts < 5 && e.code == 400 && temperature && msg.contains("temperature", ignoreCase = true)) { temperature = false; continue }
                 if (attempts < 5 && e.code == 400 && reasoning && msg.contains("reasoning", ignoreCase = true)) { reasoning = false; continue }
+                // 요청이 몰렸거나(429) 서버가 바쁠 때(503)는 잠시 기다렸다가 다시 시도한다.
+                if ((e.code == 429 || e.code == 503) && busyRetries < 4) {
+                    Thread.sleep(2000L * (1 shl busyRetries))
+                    busyRetries++
+                    continue
+                }
                 throw e
             } catch (e: java.net.SocketTimeoutException) {
                 if (!timeoutRetried) { timeoutRetried = true; continue }
@@ -475,7 +525,7 @@ class MainActivity : Activity() {
             .put("model", modelName)
             .put("messages", messages)
         if (includeTemperature) body.put("temperature", 0.1)
-        if (includeReasoning) body.put("reasoning_effort", "low")
+        if (includeReasoning) body.put("reasoning_effort", if (modelName.contains("lite", ignoreCase = true)) "minimal" else "low")
         val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 30000
@@ -614,9 +664,9 @@ class MainActivity : Activity() {
 
     private fun initialModel(): String {
         val saved = prefs.getString("model", null)
-        val applied = prefs.getBoolean("model_default_v2", false)
-        // 예전 기본값(gpt-*, gemini-2.5-flash)이 저장돼 있으면 한 번만 새 기본 모델로 바꾼다.
-        val old = saved != null && (saved.startsWith("gpt", ignoreCase = true) || saved == "gemini-2.5-flash")
+        val applied = prefs.getBoolean("model_default_v3", false)
+        // 예전 기본값(gpt-*, gemini-2.5-flash, gemini-3.8-flash)이 저장돼 있으면 한 번만 새 기본 모델(빠른 lite)로 바꾼다.
+        val old = saved != null && (saved.startsWith("gpt", ignoreCase = true) || saved == "gemini-2.5-flash" || saved == MODEL_ACCURATE)
         return if (saved.isNullOrBlank() || (!applied && old)) DEFAULT_MODEL else saved
     }
 
@@ -628,7 +678,7 @@ class MainActivity : Activity() {
             .putBoolean("remember_key", rememberKey.isChecked)
             .putBoolean("one_line", oneLineBox.isChecked)
             .putBoolean("gemini_default_applied", true)
-            .putBoolean("model_default_v2", true)
+            .putBoolean("model_default_v3", true)
         if (rememberKey.isChecked) e.putString("api_key", apiKey.text.toString().trim()) else e.remove("api_key")
         destinationTree?.let { e.putString("tree", it.toString()) }
         e.apply()
@@ -643,5 +693,6 @@ class MainActivity : Activity() {
         super.onDestroy()
         mainHandler.removeCallbacksAndMessages(null)
         executor.shutdownNow()
+        workers.shutdownNow()
     }
 }
