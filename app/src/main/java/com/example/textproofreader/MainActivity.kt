@@ -60,6 +60,7 @@ class MainActivity : Activity() {
         private const val DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         private const val MODEL_FAST = "gemini-3.5-flash-lite"
         private const val MODEL_ACCURATE = "gemini-3.8-flash"
+        private const val MODEL_31 = "gemini-3.1-flash-lite"
         private const val DEFAULT_MODEL = MODEL_FAST
     }
 
@@ -140,9 +141,10 @@ class MainActivity : Activity() {
         root.addView(label("모델 선택"))
         val presetNames = listOf(
             "$MODEL_FAST  (빠름 · 기본)",
-            "$MODEL_ACCURATE  (더 정확)"
+            "$MODEL_ACCURATE  (더 정확)",
+            "$MODEL_31  (빠름 · 이전 세대)"
         )
-        val presetIds = listOf(MODEL_FAST, MODEL_ACCURATE)
+        val presetIds = listOf(MODEL_FAST, MODEL_ACCURATE, MODEL_31)
         val modelSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, presetNames)
         }
