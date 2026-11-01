@@ -54,9 +54,9 @@ class MainActivity : Activity() {
     companion object {
         private const val REQ_OPEN_TEXT = 1001
         private const val REQ_PICK_FOLDER = 1002
-        private const val CHUNK_CHARS = 3000
+        private const val CHUNK_CHARS = 2000
         private const val DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        private const val DEFAULT_MODEL = "gemini-2.5-flash"
+        private const val DEFAULT_MODEL = "gemini-3.8-flash"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -428,17 +428,29 @@ class MainActivity : Activity() {
     }
 
     private fun callAi(apiUrl: String, key: String, modelName: String, source: String): String {
-        return try {
-            callAiOnce(apiUrl, key, modelName, source, includeTemperature = true)
-        } catch (e: ApiException) {
-            // 일부 최신 모델은 temperature 지정을 허용하지 않으므로, 그 경우 생략하고 재시도한다.
-            if (e.code == 400 && (e.message ?: "").contains("temperature", ignoreCase = true)) {
-                callAiOnce(apiUrl, key, modelName, source, includeTemperature = false)
-            } else throw e
+        val isGemini = apiUrl.contains("generativelanguage.googleapis.com", ignoreCase = true)
+        // Gemini 3 계열은 temperature를 기본값으로 두는 것이 권장되고, 생각(thinking) 시간을 줄여야 빠르다.
+        var temperature = !isGemini
+        var reasoning = isGemini
+        var timeoutRetried = false
+        var attempts = 0
+        while (true) {
+            attempts++
+            try {
+                return callAiOnce(apiUrl, key, modelName, source, temperature, reasoning)
+            } catch (e: ApiException) {
+                val msg = e.message ?: ""
+                if (attempts < 5 && e.code == 400 && temperature && msg.contains("temperature", ignoreCase = true)) { temperature = false; continue }
+                if (attempts < 5 && e.code == 400 && reasoning && msg.contains("reasoning", ignoreCase = true)) { reasoning = false; continue }
+                throw e
+            } catch (e: java.net.SocketTimeoutException) {
+                if (!timeoutRetried) { timeoutRetried = true; continue }
+                throw IllegalStateException("응답 시간 초과: 서버가 오래 응답하지 않습니다. 인터넷 연결을 확인하거나 잠시 뒤 다시 시도하세요.")
+            }
         }
     }
 
-    private fun callAiOnce(apiUrl: String, key: String, modelName: String, source: String, includeTemperature: Boolean): String {
+    private fun callAiOnce(apiUrl: String, key: String, modelName: String, source: String, includeTemperature: Boolean, includeReasoning: Boolean): String {
         val extraRule = if (oneLineMode) "\n12. 한 줄 원칙: 하나의 문장은 반드시 한 줄로 표시하고, 문장 중간에 줄바꿈을 넣지 않음(문단 사이의 빈 줄은 유지)." else ""
         val lineRule = if (oneLineMode) "문단 구분(빈 줄)은 유지하되, 하나의 문장은 반드시 한 줄에 쓰고 문장 중간에 줄바꿈을 넣지 마세요." else "원문에 있는 줄바꿈과 문단 구조는 가능한 한 유지하세요."
         val userNote = if (oneLineMode) "원문의 의미를 유지하고, 하나의 문장은 한 줄로 쓰세요." else "원문의 의미와 줄바꿈을 유지하세요."
@@ -463,10 +475,11 @@ class MainActivity : Activity() {
             .put("model", modelName)
             .put("messages", messages)
         if (includeTemperature) body.put("temperature", 0.1)
+        if (includeReasoning) body.put("reasoning_effort", "low")
         val conn = (URL(apiUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 20000
-            readTimeout = 120000
+            connectTimeout = 30000
+            readTimeout = 300000
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             setRequestProperty("Authorization", "Bearer $key")
@@ -477,8 +490,18 @@ class MainActivity : Activity() {
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val response = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() } ?: ""
             if (code !in 200..299) {
-                val message = try { JSONObject(response).optJSONObject("error")?.optString("message") } catch (_: Exception) { null }
-                throw ApiException(code, "HTTP $code${if (!message.isNullOrBlank()) ": $message" else ". API 주소, 키, 모델을 확인하세요."}")
+                // Gemini는 오류를 배열([{"error":...}])로 줄 때가 있어 둘 다 처리한다.
+                val message = try {
+                    val t = response.trim()
+                    val obj = if (t.startsWith("[")) JSONArray(t).optJSONObject(0) else JSONObject(t)
+                    obj?.optJSONObject("error")?.optString("message")
+                } catch (_: Exception) { null }
+                val detail = when {
+                    !message.isNullOrBlank() -> message
+                    response.isNotBlank() -> response.trim().take(200)
+                    else -> "API 주소, 키, 모델을 확인하세요."
+                }
+                throw ApiException(code, "HTTP $code: $detail")
             }
             val choice = JSONObject(response).optJSONArray("choices")?.optJSONObject(0)
             if (choice?.optString("finish_reason") == "length") {
@@ -591,8 +614,10 @@ class MainActivity : Activity() {
 
     private fun initialModel(): String {
         val saved = prefs.getString("model", null)
-        val applied = prefs.getBoolean("gemini_default_applied", false)
-        return if (saved.isNullOrBlank() || (!applied && saved.startsWith("gpt", ignoreCase = true))) DEFAULT_MODEL else saved
+        val applied = prefs.getBoolean("model_default_v2", false)
+        // 예전 기본값(gpt-*, gemini-2.5-flash)이 저장돼 있으면 한 번만 새 기본 모델로 바꾼다.
+        val old = saved != null && (saved.startsWith("gpt", ignoreCase = true) || saved == "gemini-2.5-flash")
+        return if (saved.isNullOrBlank() || (!applied && old)) DEFAULT_MODEL else saved
     }
 
     private fun savePrefs() {
@@ -603,6 +628,7 @@ class MainActivity : Activity() {
             .putBoolean("remember_key", rememberKey.isChecked)
             .putBoolean("one_line", oneLineBox.isChecked)
             .putBoolean("gemini_default_applied", true)
+            .putBoolean("model_default_v2", true)
         if (rememberKey.isChecked) e.putString("api_key", apiKey.text.toString().trim()) else e.remove("api_key")
         destinationTree?.let { e.putString("tree", it.toString()) }
         e.apply()
